@@ -3,7 +3,6 @@ import os
 import io
 import json
 import platform
-import math
 import time
 from datetime import datetime
 from docx import Document
@@ -12,13 +11,14 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QListWidget, QListWidgetItem, QColorDialog, QDialog,
                              QDialogButtonBox, QMessageBox, QFormLayout, QPlainTextEdit, QProgressBar,
                              QComboBox, QMenu, QFrame, QGroupBox, QRadioButton)
-from PyQt6.QtCore import Qt, QSize, QPoint, pyqtSignal, QEvent, QThread, pyqtSlot
+from PyQt6.QtCore import Qt, QSize, QPoint, pyqtSignal, QThread, pyqtSlot
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QDragEnterEvent, QDropEvent, QAction, QColor, QMouseEvent, QPainter, \
     QFont
 from PIL import Image, ImageDraw, ImageFont
 
-# 使用 pip 安装所需库
+# 依赖安装命令
 # pip install python-docx PyQt6 Pillow
+
 # --- 配置管理 ---
 CONFIG_FILE = "wm_settings.json"
 DEFAULT_CONFIG = {
@@ -26,7 +26,7 @@ DEFAULT_CONFIG = {
     "size_percent": 5,
     "opacity": 50,
     "angle": 45,
-    "color": "#FF0000",
+    "color": "#FF0000",  # 默认红色（属于保留颜色）
     "fill_mode": "single",
     "offset_x": 0,
     "offset_y": 0
@@ -34,36 +34,35 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    """加载配置，并确保兼容旧版本文件，包含所有默认键。"""
+    """加载配置，兼容旧版本并补全默认键"""
     config = DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 loaded_config = json.load(f)
-                for key, default_value in DEFAULT_CONFIG.items():
+                for key in DEFAULT_CONFIG:
                     if key in loaded_config:
                         config[key] = loaded_config[key]
                 return config
         except Exception as e:
-            print(f"Error loading config file: {e}. Using default settings.")
+            print(f"加载配置失败: {e}，使用默认设置")
     return config
 
 
 def save_config(config):
-    """保存当前配置到文件。"""
+    """保存配置到本地文件"""
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
 
 
-# --- 辅助函数：获取系统字体 ---
+# --- 辅助函数：获取系统默认字体 ---
 def get_default_font_path():
-    """尝试获取一个常见的中文字体路径。"""
+    """适配Windows/Mac/Linux的中文字体路径"""
     system = platform.system()
     if system == "Windows":
         fonts = ["msyh.ttc", "simhei.ttf", "arial.ttf"]
-        font_dir = "C:\\Windows\\Fonts"
         for f in fonts:
-            path = os.path.join(font_dir, f)
+            path = os.path.join("C:\\Windows\\Fonts", f)
             if os.path.exists(path):
                 return path
     elif system == "Darwin":  # MacOS
@@ -75,99 +74,119 @@ def get_default_font_path():
 
 # --- 辅助函数：图片格式验证 ---
 def is_supported_image(path):
-    """判断文件是否为支持的图片格式"""
-    supported_formats = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')
-    return path.lower().endswith(supported_formats)
+    """判断是否为支持的图片格式"""
+    supported = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff')
+    return path.lower().endswith(supported)
 
 
-# --- 核心水印逻辑（优化旋转中心）---
+# --- 辅助函数：图片格式处理（PIL兼容+后缀统一）---
+def get_image_format(path_or_pil):
+    """
+    返回 (PIL保存格式, 文件名后缀)
+    - PIL格式：JPEG/JPG统一为'JPEG'（符合PIL规范）
+    - 后缀：统一为'jpg'（用户习惯）
+    """
+    if isinstance(path_or_pil, str):
+        ext = os.path.splitext(path_or_pil)[1].lower()
+        if ext in ['.jpeg', '.jpg']:
+            return ('JPEG', 'jpg')
+        elif ext == '.png':
+            return ('PNG', 'png')
+        elif ext == '.bmp':
+            return ('BMP', 'bmp')
+        elif ext == '.gif':
+            return ('GIF', 'gif')
+        elif ext == '.tiff':
+            return ('TIFF', 'tiff')
+        else:
+            return ('JPEG', 'jpg')  # 默认 fallback
+    else:
+        fmt = path_or_pil.format.upper() if path_or_pil.format else 'JPEG'
+        return ('JPEG', 'jpg') if fmt == 'JPG' else (fmt, fmt.lower())
+
+
+# --- 核心水印逻辑（保留原格式+旋转优化）---
 def apply_watermark_to_image(pil_image, settings):
-    """根据设置对PIL Image对象添加水印。优化：以水印文字中心为旋转中心"""
-    # 处理跳过水印的情况
+    """添加水印，支持跳过水印、以文字中心旋转、保留原格式"""
+    # 处理跳过水印的情况（允许settings仅含skip_watermark）
     if isinstance(settings, dict) and settings.get('skip_watermark', False):
         return pil_image
 
+    # 补全settings中缺失的必填字段（从默认配置获取）
+    full_settings = DEFAULT_CONFIG.copy()
+    full_settings.update(settings)  # 用传入的settings覆盖默认值
+
+    # 转为RGBA以便叠加水印
     base_image = pil_image.convert("RGBA")
     width, height = base_image.size
     txt_layer = Image.new("RGBA", base_image.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(txt_layer)
 
-    # 字体大小计算
-    font_size = max(10, int(width * (settings.get('size_percent', 5) / 100)))
+    # 字体大小计算（按图片宽度百分比）
+    font_size = max(10, int(width * (full_settings['size_percent'] / 100)))
     font_path = get_default_font_path()
     try:
         font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
-    except Exception:
+    except:
         font = ImageFont.load_default()
 
-    # 基础参数
-    text = settings['text']
-    opacity = int(settings['opacity'] * 255 / 100)
-    hex_color = settings['color'].lstrip('#')
+    # 水印基础参数（使用补全后的full_settings）
+    text = full_settings['text']
+    opacity = int(full_settings['opacity'] * 255 / 100)
+    hex_color = full_settings['color'].lstrip('#')
     try:
         rgb = tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
     except:
-        rgb = (255, 0, 0)
+        rgb = (255, 0, 0)  # 默认红色
     fill_color = rgb + (opacity,)
 
-    # 计算文字尺寸和中心点
+    # 计算文字尺寸与中心点
     try:
-        bbox = draw.textbbox((0, 0), text, font=font)  # (left, top, right, bottom)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        text_center_x = text_w / 2  # 文字自身的中心点X
-        text_center_y = text_h / 2  # 文字自身的中心点Y
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
     except:
         text_w, text_h = draw.textsize(text, font=font)
-        text_center_x = text_w / 2
-        text_center_y = text_h / 2
+    text_center_x, text_center_y = text_w / 2, text_h / 2
 
-    # 偏移量转换（百分比→像素）
-    fill_mode = settings.get('fill_mode', 'single')
-    offset_x_px = settings.get('offset_x', 0) / 100 * width
-    offset_y_px = settings.get('offset_y', 0) / 100 * height
+    # 偏移量（百分比转像素）
+    fill_mode = full_settings['fill_mode']
+    offset_x_px = full_settings['offset_x'] / 100 * width
+    offset_y_px = full_settings['offset_y'] / 100 * height
 
-    # 计算文字绘制的基准位置（图片中心 + 偏移）
-    base_x = (width / 2) - text_center_x + offset_x_px  # 让文字中心对齐图片中心（加偏移）
-    base_y = (height / 2) - text_center_y + offset_y_px
+    # 文字基准位置（图片中心+偏移）
+    base_x = (width / 2 - text_center_x) + offset_x_px
+    base_y = (height / 2 - text_center_y) + offset_y_px
 
+    # 绘制水印（单个/平铺）
     if fill_mode == 'single':
-        # 单个水印：直接绘制在基准位置
         draw.text((base_x, base_y), text, font=font, fill=fill_color)
     elif fill_mode == 'tiled':
-        # 平铺水印：基于基准位置生成网格
-        spacing_x = int(text_w * 1.5)
-        spacing_y = int(text_h * 2.5)
-        # 计算起始位置（确保左上角能覆盖到）
+        spacing_x, spacing_y = int(text_w * 1.5), int(text_h * 2.5)
         start_x = base_x - (base_x // spacing_x) * spacing_x
         start_y = base_y - (base_y // spacing_y) * spacing_y
-        # 绘制平铺网格
         for i in range(-1, int(width / spacing_x) + 2):
             for j in range(-1, int(height / spacing_y) + 2):
-                x = start_x + i * spacing_x
-                y = start_y + j * spacing_y
-                draw.text((x, y), text, font=font, fill=fill_color)
+                draw.text((start_x + i * spacing_x, start_y + j * spacing_y), text, font=font, fill=fill_color)
 
-    # 优化旋转：以文字中心为旋转中心（而非图片中心）
-    angle = settings['angle']
+    # 旋转（以文字中心为轴心）
+    angle = full_settings['angle']
     if angle != 0:
-        # 计算文字在画布上的实际中心点坐标（基准位置 + 文字自身中心）
-        canvas_text_center_x = base_x + text_center_x
-        canvas_text_center_y = base_y + text_center_y
-        # 旋转时以文字中心为轴心
+        canvas_text_center = (base_x + text_center_x, base_y + text_center_y)
         txt_layer = txt_layer.rotate(
             angle,
-            center=(canvas_text_center_x, canvas_text_center_y),  # 优化：文字中心作为旋转中心
+            center=canvas_text_center,
             expand=False,
-            resample=Image.Resampling.BICUBIC  # 抗锯齿
+            resample=Image.Resampling.BICUBIC
         )
 
-    # 合并图层
+    # 合并图层并恢复原格式（去除Alpha通道）
     out = Image.alpha_composite(base_image, txt_layer)
+    if pil_image.mode != 'RGBA':
+        out = out.convert(pil_image.mode)
     return out
 
 
-# --- 可拖拽的预览QLabel（优化拖拽方向）---
+# --- 可拖拽预览标签 ---
 class DraggablePreviewLabel(QLabel):
     offsetChanged = pyqtSignal(int, int)
 
@@ -177,103 +196,92 @@ class DraggablePreviewLabel(QLabel):
         self.setStyleSheet("background-color: #333; border: 1px solid #555;")
         self._pixmap_original = None
         self._current_settings = {}
-        self._watermarked_pixmap = None
         self._start_pos = None
         self._current_offset_x = 0
         self._current_offset_y = 0
-        self.setMouseTracking(False)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def set_image(self, pil_image):
-        """设置要预览的原始图片。"""
+        """设置原始图片"""
         self._pixmap_original = pil_image.copy()
         self.update_watermark_display()
 
     def set_settings(self, settings):
-        """设置水印参数，并触发更新。"""
-        self._current_settings = settings.copy()
-        self._current_offset_x = self._current_settings.get('offset_x', 0)
-        self._current_offset_y = self._current_settings.get('offset_y', 0)
+        """设置水印参数并更新预览（补全缺失字段）"""
+        # 补全settings，确保所有字段存在
+        full_settings = DEFAULT_CONFIG.copy()
+        full_settings.update(settings)
+        self._current_settings = full_settings
+        self._current_offset_x = full_settings['offset_x']
+        self._current_offset_y = full_settings['offset_y']
         self.update_watermark_display()
 
     def update_watermark_display(self):
-        """根据当前图片和设置生成带水印的图片并显示。"""
+        """生成带水印的预览图"""
         if self._pixmap_original is None:
+            # 空预览背景
             pix = QPixmap(self.size())
             pix.fill(QColor("#333333"))
             painter = QPainter(pix)
             painter.setPen(QColor("#AAAAAA"))
             painter.setFont(QFont("Arial", 16))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "等待拖入图片或Word文档...")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "等待拖入图片/Word文档...")
             painter.end()
             self.setPixmap(pix)
             return
 
-        display_settings = self._current_settings.copy()
-        display_settings['offset_x'] = self._current_offset_x
-        display_settings['offset_y'] = self._current_offset_y
-
+        # 应用补全后的设置生成水印
+        watermarked_pil = apply_watermark_to_image(self._pixmap_original, self._current_settings)
         try:
-            watermarked_pil = apply_watermark_to_image(self._pixmap_original, display_settings)
             im_data = watermarked_pil.convert("RGBA").tobytes("raw", "RGBA")
             qim = QImage(im_data, watermarked_pil.width, watermarked_pil.height, QImage.Format.Format_RGBA8888)
-            self._watermarked_pixmap = QPixmap.fromImage(qim)
-            self.setPixmap(self._watermarked_pixmap.scaled(
+            pix = QPixmap.fromImage(qim).scaled(
                 self.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation
-            ))
+            )
+            self.setPixmap(pix)
         except Exception as e:
-            print(f"水印渲染错误: {e}")
+            print(f"预览渲染错误: {e}")
 
-    def resizeEvent(self, event: QEvent):
-        """当QLabel大小改变时，重新绘制水印以适应新尺寸。"""
+    def resizeEvent(self, event):
+        """尺寸变化时重新渲染"""
         super().resizeEvent(event)
         self.update_watermark_display()
 
-    def mousePressEvent(self, event: QMouseEvent):
+    def mousePressEvent(self, event):
+        """鼠标按下：记录起始位置"""
         if event.button() == Qt.MouseButton.LeftButton and self._pixmap_original:
             self._start_pos = event.pos()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
-    def mouseMoveEvent(self, event: QMouseEvent):
+    def mouseMoveEvent(self, event):
+        """鼠标拖动：更新偏移量"""
         if self._start_pos and event.buttons() & Qt.MouseButton.LeftButton and self._pixmap_original:
-            # 1. 计算鼠标在预览区的相对移动量（屏幕坐标）
+            # 计算移动量（预览→原图比例转换）
             delta_screen = event.pos() - self._start_pos
+            original_w, original_h = self._pixmap_original.width, self._pixmap_original.height
+            scaled_size = self.pixmap().size() if self.pixmap() else QSize(1, 1)
+            scale_x = original_w / scaled_size.width() if scaled_size.width() > 0 else 1.0
+            scale_y = original_h / scaled_size.height() if scaled_size.height() > 0 else 1.0
 
-            # 2. 获取缩放比例（预览图 → 原始图）
-            original_width = self._pixmap_original.width
-            original_height = self._pixmap_original.height
-            current_pixmap = self.pixmap()
-
-            if current_pixmap and not current_pixmap.isNull():
-                scaled_size = current_pixmap.size()
-                scale_x = original_width / scaled_size.width() if scaled_size.width() > 0 else 1.0
-                scale_y = original_height / scaled_size.height() if scaled_size.height() > 0 else 1.0
-            else:
-                scale_x = scale_y = 1.0
-
-            # 3. 优化拖拽方向：将屏幕移动量转换为原始图的像素移动（不依赖旋转角度）
-            # 核心逻辑：拖拽方向始终与鼠标移动方向一致，忽略水印旋转角度
-            delta_x_img_px = delta_screen.x() * scale_x
-            delta_y_img_px = delta_screen.y() * scale_y
-
-            # 4. 转换为百分比偏移（相对于原始图片尺寸）
-            delta_x_percent = (delta_x_img_px / original_width) * 100
-            delta_y_percent = (delta_y_img_px / original_height) * 100
-
-            # 5. 更新偏移量（限制范围）
+            # 转换为百分比偏移（限制范围：-200~200%）
+            delta_x_percent = (delta_screen.x() * scale_x / original_w) * 100
+            delta_y_percent = (delta_screen.y() * scale_y / original_h) * 100
             self._current_offset_x = max(-200, min(200, self._current_offset_x + delta_x_percent))
             self._current_offset_y = max(-200, min(200, self._current_offset_y + delta_y_percent))
 
-            # 6. 触发更新
+            # 同步更新UI（补全设置）
             self._start_pos = event.pos()
             self.offsetChanged.emit(int(self._current_offset_x), int(self._current_offset_y))
+            # 更新当前设置中的偏移量
+            self._current_settings['offset_x'] = self._current_offset_x
+            self._current_settings['offset_y'] = self._current_offset_y
             self.update_watermark_display()
-
         super().mouseMoveEvent(event)
 
-    def mouseReleaseEvent(self, event: QMouseEvent):
+    def mouseReleaseEvent(self, event):
+        """鼠标释放：重置状态"""
         self._start_pos = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
@@ -285,86 +293,110 @@ class EditDialog(QDialog):
         self.setWindowTitle("单独微调图片")
         self.resize(900, 600)
         self.original_pil = Image.open(io.BytesIO(image_data)) if isinstance(image_data, bytes) else image_data
-        self.settings = current_settings.copy()
+        self.pil_format, self.file_ext = get_image_format(self.original_pil)
+        # 补全settings，确保所有字段存在（避免缺失'text'等）
+        self.settings = DEFAULT_CONFIG.copy()
+        self.settings.update(current_settings)
+        self.init_ui()
+
+    def init_ui(self):
+        """初始化对话框UI（使用补全后的settings）"""
         main_layout = QHBoxLayout(self)
 
+        # 预览区域
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setStyleSheet("background-color: #333;")
         main_layout.addWidget(self.preview_label, stretch=2)
 
-        ctrl = QWidget()
-        form = QFormLayout(ctrl)
+        # 控制区域
+        ctrl_widget = QWidget()
+        form_layout = QFormLayout(ctrl_widget)
+
+        # 水印文字（使用补全后的settings，避免KeyError）
         self.inp_text = QLineEdit(self.settings['text'])
         self.inp_text.textChanged.connect(self.update_preview)
-        form.addRow("文字:", self.inp_text)
+        form_layout.addRow("文字:", self.inp_text)
 
+        # 字体大小（1-50%）
         self.sl_size = QSlider(Qt.Orientation.Horizontal)
         self.sl_size.setRange(1, 50)
-        self.sl_size.setValue(self.settings.get('size_percent', 5))
+        self.sl_size.setValue(self.settings['size_percent'])
         self.sl_size.valueChanged.connect(self.update_preview)
-        form.addRow("大小 (相对比例):", self.sl_size)
+        form_layout.addRow("字体大小 (%):", self.sl_size)
 
+        # 透明度（0-100%）
         self.sl_opacity = QSlider(Qt.Orientation.Horizontal)
         self.sl_opacity.setRange(0, 100)
         self.sl_opacity.setValue(self.settings['opacity'])
         self.sl_opacity.valueChanged.connect(self.update_preview)
-        form.addRow("透明度:", self.sl_opacity)
+        form_layout.addRow("透明度 (%):", self.sl_opacity)
 
+        # 旋转角度（0-360°）
         self.sl_angle = QSlider(Qt.Orientation.Horizontal)
         self.sl_angle.setRange(0, 360)
         self.sl_angle.setValue(self.settings['angle'])
         self.sl_angle.valueChanged.connect(self.update_preview)
-        form.addRow("旋转角度:", self.sl_angle)
+        form_layout.addRow("旋转角度:", self.sl_angle)
 
+        # X/Y轴偏移（-200~200%）
         self.sl_offset_x = QSlider(Qt.Orientation.Horizontal)
         self.sl_offset_x.setRange(-200, 200)
-        self.sl_offset_x.setValue(self.settings.get('offset_x', 0))
+        self.sl_offset_x.setValue(self.settings['offset_x'])
         self.sl_offset_x.valueChanged.connect(self.update_preview)
-        form.addRow("X轴偏移 (%):", self.sl_offset_x)
+        form_layout.addRow("X轴偏移 (%):", self.sl_offset_x)
 
         self.sl_offset_y = QSlider(Qt.Orientation.Horizontal)
         self.sl_offset_y.setRange(-200, 200)
-        self.sl_offset_y.setValue(self.settings.get('offset_y', 0))
+        self.sl_offset_y.setValue(self.settings['offset_y'])
         self.sl_offset_y.valueChanged.connect(self.update_preview)
-        form.addRow("Y轴偏移 (%):", self.sl_offset_y)
+        form_layout.addRow("Y轴偏移 (%):", self.sl_offset_y)
 
+        # 填充模式
         self.cmb_fill_mode = QComboBox()
         self.cmb_fill_mode.addItem("单个 (居中)", "single")
         self.cmb_fill_mode.addItem("平铺 (重复)", "tiled")
         idx = self.cmb_fill_mode.findData(self.settings['fill_mode'])
-        if idx != -1: self.cmb_fill_mode.setCurrentIndex(idx)
+        if idx != -1:
+            self.cmb_fill_mode.setCurrentIndex(idx)
         self.cmb_fill_mode.currentIndexChanged.connect(self.update_preview)
-        form.addRow("填充模式:", self.cmb_fill_mode)
+        form_layout.addRow("填充模式:", self.cmb_fill_mode)
 
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        form.addRow(btns)
+        # 确认/取消按钮
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        form_layout.addRow(btn_box)
 
-        main_layout.addWidget(ctrl, stretch=1)
+        main_layout.addWidget(ctrl_widget, stretch=1)
         self.update_preview()
 
     def update_preview(self):
-        self.settings['text'] = self.inp_text.text()
-        self.settings['size_percent'] = self.sl_size.value()
-        self.settings['opacity'] = self.sl_opacity.value()
-        self.settings['angle'] = self.sl_angle.value()
-        self.settings['offset_x'] = self.sl_offset_x.value()
-        self.settings['offset_y'] = self.sl_offset_y.value()
-        self.settings['fill_mode'] = self.cmb_fill_mode.currentData()
-
-        img = apply_watermark_to_image(self.original_pil, self.settings)
-        im_data = img.convert("RGBA").tobytes("raw", "RGBA")
-        qim = QImage(im_data, img.width, img.height, QImage.Format.Format_RGBA8888)
-        pix = QPixmap.fromImage(qim)
-        self.preview_label.setPixmap(pix.scaled(
-            self.preview_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ))
+        """更新预览图（使用补全后的settings）"""
+        self.settings.update({
+            'text': self.inp_text.text(),
+            'size_percent': self.sl_size.value(),
+            'opacity': self.sl_opacity.value(),
+            'angle': self.sl_angle.value(),
+            'offset_x': self.sl_offset_x.value(),
+            'offset_y': self.sl_offset_y.value(),
+            'fill_mode': self.cmb_fill_mode.currentData()
+        })
+        watermarked_pil = apply_watermark_to_image(self.original_pil, self.settings)
+        try:
+            im_data = watermarked_pil.convert("RGBA").tobytes("raw", "RGBA")
+            qim = QImage(im_data, watermarked_pil.width, watermarked_pil.height, QImage.Format.Format_RGBA8888)
+            pix = QPixmap.fromImage(qim).scaled(
+                self.preview_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.preview_label.setPixmap(pix)
+        except Exception as e:
+            self.parent().log(f"预览更新错误: {str(e)}")
 
     def get_settings(self):
+        """返回编辑后的设置（保留skip_watermark标记）"""
         return self.settings
 
 
@@ -375,86 +407,110 @@ class BatchEditDialog(QDialog):
         self.setWindowTitle("批量修改水印")
         self.resize(900, 600)
         self.original_pil = preview_image
-        self.settings = current_settings.copy()
+        self.pil_format, self.file_ext = get_image_format(self.original_pil)
+        # 补全settings，确保所有字段存在
+        self.settings = DEFAULT_CONFIG.copy()
+        self.settings.update(current_settings)
+        self.init_ui()
+
+    def init_ui(self):
+        """初始化UI（与单独编辑一致，复用逻辑）"""
         main_layout = QHBoxLayout(self)
 
+        # 预览区域
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setStyleSheet("background-color: #333;")
         main_layout.addWidget(self.preview_label, stretch=2)
 
-        ctrl = QWidget()
-        form = QFormLayout(ctrl)
+        # 控制区域
+        ctrl_widget = QWidget()
+        form_layout = QFormLayout(ctrl_widget)
+
+        # 水印文字（补全后无KeyError）
         self.inp_text = QLineEdit(self.settings['text'])
         self.inp_text.textChanged.connect(self.update_preview)
-        form.addRow("文字:", self.inp_text)
+        form_layout.addRow("文字:", self.inp_text)
 
+        # 字体大小
         self.sl_size = QSlider(Qt.Orientation.Horizontal)
         self.sl_size.setRange(1, 50)
-        self.sl_size.setValue(self.settings.get('size_percent', 5))
+        self.sl_size.setValue(self.settings['size_percent'])
         self.sl_size.valueChanged.connect(self.update_preview)
-        form.addRow("大小 (相对比例):", self.sl_size)
+        form_layout.addRow("字体大小 (%):", self.sl_size)
 
+        # 透明度
         self.sl_opacity = QSlider(Qt.Orientation.Horizontal)
         self.sl_opacity.setRange(0, 100)
         self.sl_opacity.setValue(self.settings['opacity'])
         self.sl_opacity.valueChanged.connect(self.update_preview)
-        form.addRow("透明度:", self.sl_opacity)
+        form_layout.addRow("透明度 (%):", self.sl_opacity)
 
+        # 旋转角度
         self.sl_angle = QSlider(Qt.Orientation.Horizontal)
         self.sl_angle.setRange(0, 360)
         self.sl_angle.setValue(self.settings['angle'])
         self.sl_angle.valueChanged.connect(self.update_preview)
-        form.addRow("旋转角度:", self.sl_angle)
+        form_layout.addRow("旋转角度:", self.sl_angle)
 
+        # X/Y轴偏移
         self.sl_offset_x = QSlider(Qt.Orientation.Horizontal)
         self.sl_offset_x.setRange(-200, 200)
-        self.sl_offset_x.setValue(self.settings.get('offset_x', 0))
+        self.sl_offset_x.setValue(self.settings['offset_x'])
         self.sl_offset_x.valueChanged.connect(self.update_preview)
-        form.addRow("X轴偏移 (%):", self.sl_offset_x)
+        form_layout.addRow("X轴偏移 (%):", self.sl_offset_x)
 
         self.sl_offset_y = QSlider(Qt.Orientation.Horizontal)
         self.sl_offset_y.setRange(-200, 200)
-        self.sl_offset_y.setValue(self.settings.get('offset_y', 0))
+        self.sl_offset_y.setValue(self.settings['offset_y'])
         self.sl_offset_y.valueChanged.connect(self.update_preview)
-        form.addRow("Y轴偏移 (%):", self.sl_offset_y)
+        form_layout.addRow("Y轴偏移 (%):", self.sl_offset_y)
 
+        # 填充模式
         self.cmb_fill_mode = QComboBox()
         self.cmb_fill_mode.addItem("单个 (居中)", "single")
         self.cmb_fill_mode.addItem("平铺 (重复)", "tiled")
         idx = self.cmb_fill_mode.findData(self.settings['fill_mode'])
-        if idx != -1: self.cmb_fill_mode.setCurrentIndex(idx)
+        if idx != -1:
+            self.cmb_fill_mode.setCurrentIndex(idx)
         self.cmb_fill_mode.currentIndexChanged.connect(self.update_preview)
-        form.addRow("填充模式:", self.cmb_fill_mode)
+        form_layout.addRow("填充模式:", self.cmb_fill_mode)
 
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        form.addRow(btns)
+        # 按钮
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        form_layout.addRow(btn_box)
 
-        main_layout.addWidget(ctrl, stretch=1)
+        main_layout.addWidget(ctrl_widget, stretch=1)
         self.update_preview()
 
     def update_preview(self):
-        self.settings['text'] = self.inp_text.text()
-        self.settings['size_percent'] = self.sl_size.value()
-        self.settings['opacity'] = self.sl_opacity.value()
-        self.settings['angle'] = self.sl_angle.value()
-        self.settings['offset_x'] = self.sl_offset_x.value()
-        self.settings['offset_y'] = self.sl_offset_y.value()
-        self.settings['fill_mode'] = self.cmb_fill_mode.currentData()
-
-        img = apply_watermark_to_image(self.original_pil, self.settings)
-        im_data = img.convert("RGBA").tobytes("raw", "RGBA")
-        qim = QImage(im_data, img.width, img.height, QImage.Format.Format_RGBA8888)
-        pix = QPixmap.fromImage(qim)
-        self.preview_label.setPixmap(pix.scaled(
-            self.preview_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ))
+        """更新预览（使用补全后的settings）"""
+        self.settings.update({
+            'text': self.inp_text.text(),
+            'size_percent': self.sl_size.value(),
+            'opacity': self.sl_opacity.value(),
+            'angle': self.sl_angle.value(),
+            'offset_x': self.sl_offset_x.value(),
+            'offset_y': self.sl_offset_y.value(),
+            'fill_mode': self.cmb_fill_mode.currentData()
+        })
+        watermarked_pil = apply_watermark_to_image(self.original_pil, self.settings)
+        try:
+            im_data = watermarked_pil.convert("RGBA").tobytes("raw", "RGBA")
+            qim = QImage(im_data, watermarked_pil.width, watermarked_pil.height, QImage.Format.Format_RGBA8888)
+            pix = QPixmap.fromImage(qim).scaled(
+                self.preview_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.preview_label.setPixmap(pix)
+        except Exception as e:
+            self.parent().log(f"预览更新错误: {str(e)}")
 
     def get_settings(self):
+        """返回批量编辑后的设置"""
         return self.settings
 
 
@@ -466,85 +522,90 @@ class ImageProcessThread(QThread):
 
     def __init__(self, image_paths, global_settings):
         super().__init__()
+        # 补全全局设置，确保线程处理时无缺失字段
+        self.global_settings = DEFAULT_CONFIG.copy()
+        self.global_settings.update(global_settings)
         self.image_paths = image_paths
-        self.global_settings = global_settings
 
     def run(self):
+        """线程执行：批量处理图片"""
         processed_images = []
         total = len(self.image_paths)
-
         for i, path in enumerate(self.image_paths):
             try:
-                # 读取原始图片
+                # 读取原图
                 with open(path, 'rb') as f:
                     original_data = f.read()
 
-                # 处理水印
+                # 处理水印（使用补全后的全局设置）
                 with Image.open(io.BytesIO(original_data)) as pil_img:
+                    pil_format, file_ext = get_image_format(pil_img)
                     watermarked_img = apply_watermark_to_image(pil_img, self.global_settings)
 
-                    # 转换为字节流
+                    # 保存为原格式（JPEG需去除Alpha）
                     out_io = io.BytesIO()
-                    # 强制统一输出为PNG格式（修复JPEG兼容性问题）
-                    watermarked_img.save(out_io, format="PNG")
+                    if pil_format == 'JPEG' and watermarked_img.mode == 'RGBA':
+                        watermarked_img = watermarked_img.convert('RGB')
+                    watermarked_img.save(out_io, format=pil_format, quality=90)
                     processed_data = out_io.getvalue()
 
+                # 记录结果（保存补全后的设置）
                 processed_images.append({
                     "original_path": path,
                     "original_data": original_data,
                     "processed_data": processed_data,
-                    "format": "PNG",  # 统一设置为PNG
+                    "pil_format": pil_format,
+                    "file_ext": file_ext,
                     "settings": self.global_settings.copy()
                 })
-
                 self.progress_update.emit(int((i + 1) / total * 100))
-
             except Exception as e:
-                self.error_signal.emit(f"处理图片 {os.path.basename(path)} 时出错: {str(e)}")
-
+                self.error_signal.emit(f"处理 {os.path.basename(path)} 失败: {str(e)}")
         self.finished_signal.emit(processed_images)
 
 
-# --- 主程序 ---
+# --- 主窗口（核心UI与逻辑）---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Word批量水印工具v6.1")
+        self.setWindowTitle("图片/Word批量水印工具 v5.6 (完整无中断版)")
         self.resize(1200, 800)
         self.setAcceptDrops(True)
         self.config = load_config()
-        self.doc = None
-        self.doc_path = None
-        self.image_parts = []  # 存储Word文档中的图片
-        self.direct_images = []  # 存储直接拖入的图片
-        self.process_thread = None
+        self.doc = None  # Word文档对象
+        self.doc_path = None  # Word路径
+        self.image_parts = []  # Word中的图片
+        self.direct_images = []  # 直接拖入的图片
+        self.process_thread = None  # 处理线程
         self.init_ui()
-        self.load_sample_image_for_preview()
+        self.load_sample_preview()
         self.update_live_preview()
 
-    def load_sample_image_for_preview(self):
-        """加载一张内置的空白图片作为预览区的背景，方便调试水印参数。"""
+    def load_sample_preview(self):
+        """加载默认预览背景图"""
         try:
             sample_img = Image.new("RGB", (800, 600), color='#f0f0f0')
             draw = ImageDraw.Draw(sample_img)
-            text = "预览背景图\n(支持拖入Word文档或图片文件)\n图片导出自动保存到：原文件夹/已加水印图片"
+            text = "预览背景图\n(支持拖入Word/图片)\n导出路径：原文件夹/已加水印图片\n颜色选项：仅灰/红/蓝"
+            font_path = get_default_font_path()
             try:
-                font = ImageFont.truetype(get_default_font_path(), 24)
+                font = ImageFont.truetype(font_path, 24) if font_path else ImageFont.load_default()
             except:
                 font = ImageFont.load_default()
+
+            # 计算文字位置（居中）
             try:
                 bbox = draw.textbbox((0, 0), text, font=font)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
+                text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
             except:
                 text_w, text_h = draw.textsize(text, font=font)
             draw.text(((800 - text_w) / 2, (600 - text_h) / 2), text, font=font, fill=(100, 100, 100))
             self.live_preview_label.set_image(sample_img)
         except Exception as e:
-            self.log(f"加载示例图片失败: {e}")
+            self.log(f"加载预览背景失败: {str(e)}")
 
     def update_live_preview(self):
-        """根据当前参数更新左侧的实时预览图。"""
+        """更新左侧实时预览（使用补全后的设置）"""
         current_settings = {
             "text": self.inp_text.text(),
             "size_percent": self.sl_size.value(),
@@ -555,63 +616,69 @@ class MainWindow(QMainWindow):
             "offset_x": self.sl_offset_x.value(),
             "offset_y": self.sl_offset_y.value()
         }
-        self.live_preview_label.set_settings(current_settings)
+        # 补全设置后再传递
+        full_settings = DEFAULT_CONFIG.copy()
+        full_settings.update(current_settings)
+        self.live_preview_label.set_settings(full_settings)
 
     def on_preview_offset_changed(self, offset_x, offset_y):
-        """当拖拽预览图时，同步更新偏移量滑块的值。"""
+        """拖拽预览时同步滑块值"""
+        # 临时断开信号避免循环更新
         self.sl_offset_x.valueChanged.disconnect(self.update_live_preview)
         self.sl_offset_y.valueChanged.disconnect(self.update_live_preview)
         self.sl_offset_x.setValue(offset_x)
         self.sl_offset_y.setValue(offset_y)
+        # 重新连接信号
         self.sl_offset_x.valueChanged.connect(self.update_live_preview)
         self.sl_offset_y.valueChanged.connect(self.update_live_preview)
 
     def set_color_ui(self, hex_color, update_config=True):
+        """更新颜色UI与配置"""
         if update_config:
             self.config['color'] = hex_color
         self.btn_color.setStyleSheet(f"text-align: left; color: {hex_color}; font-weight: bold;")
         self.update_live_preview()
 
     def show_color_menu(self):
+        """显示颜色菜单（仅灰/红/蓝）"""
         menu = QMenu(self)
+        # 仅保留三个核心颜色
         colors = {
             "灰色": "#808080",
             "红色": "#FF0000",
-            "橙色": "#FFA500",
-            "蓝色": "#0000FF",
-            "绿色": "#00FF00",
-            "黄色": "#FFFF00",
-            "黑色": "#000000"
+            "蓝色": "#0000FF"
         }
         for name, hex_code in colors.items():
             action = QAction(f"{name} ({hex_code})", self)
+            # 颜色图标
             pixmap = QPixmap(16, 16)
             pixmap.fill(QColor(hex_code))
             action.setIcon(QIcon(pixmap))
+            # 绑定颜色选择事件
             action.triggered.connect(lambda checked, h=hex_code: self.set_color_ui(h))
             menu.addAction(action)
-        menu.addSeparator()
-        picker_action = QAction("🎨 更多颜色...", self)
-        picker_action.triggered.connect(self.open_color_dialog)
-        menu.addAction(picker_action)
+        # 显示菜单（在按钮下方）
         menu.exec(self.btn_color.mapToGlobal(QPoint(0, self.btn_color.height())))
 
-    def open_color_dialog(self):
-        color = QColorDialog.getColor(QColor(self.config['color']), self, "选择水印颜色")
-        if color.isValid():
-            self.set_color_ui(color.name())
+    def log(self, msg):
+        """添加运行日志"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_box.appendPlainText(f"[{timestamp}] {msg}")
+        self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
+        QApplication.processEvents()
 
     def init_ui(self):
+        """初始化主窗口UI"""
         QApplication.setStyle("Fusion")
-        w = QWidget()
-        self.setCentralWidget(w)
-        main_h_layout = QHBoxLayout(w)
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_h_layout = QHBoxLayout(central_widget)
 
-        # --- 左侧面板 (参数设置 + 实时预览) ---
+        # ---------------------- 左侧面板（参数+预览）----------------------
         left_panel = QWidget()
         left_v_layout = QVBoxLayout(left_panel)
 
-        # 模式选择
+        # 1. 处理模式选择（Word/图片）
         mode_group = QGroupBox("处理模式")
         mode_layout = QHBoxLayout(mode_group)
         self.radio_word = QRadioButton("Word文档处理")
@@ -621,82 +688,92 @@ class MainWindow(QMainWindow):
         mode_layout.addWidget(self.radio_image)
         left_v_layout.addWidget(mode_group)
 
-        # 实时预览区域
+        # 2. 实时预览区域
         preview_frame = QFrame()
         preview_frame.setFrameShape(QFrame.Shape.Box)
         preview_frame.setFrameShadow(QFrame.Shadow.Raised)
         preview_layout = QVBoxLayout(preview_frame)
-        preview_layout.addWidget(QLabel("<b>实时预览 (拖拽水印调整位置):</b>"))
+        preview_layout.addWidget(QLabel("<b>实时预览（拖拽调整位置）:</b>"))
         self.live_preview_label = DraggablePreviewLabel()
         self.live_preview_label.setMinimumSize(280, 180)
         self.live_preview_label.offsetChanged.connect(self.on_preview_offset_changed)
         preview_layout.addWidget(self.live_preview_label)
         left_v_layout.addWidget(preview_frame)
 
-        # 导出说明（新增）
+        # 3. 导出说明
         export_note = QLabel(
-            "<font color='green'>📌 图片模式导出说明：</font><br/>自动保存到原图片所在文件夹的<br/><b>「已加水印图片」</b> 子文件夹")
+            "<font color='green'>📌 图片导出说明：</font><br/>自动保存到原文件夹的<br/><b>「已加水印图片」</b> 子文件夹<br/>保留原格式（JPEG→JPG）"
+        )
         export_note.setStyleSheet("margin: 10px 0;")
         left_v_layout.addWidget(export_note)
 
-        # 参数设置部分
+        # 4. 全局参数设置
         settings_title = QLabel("⚙️ 全局参数设置")
         settings_title.setStyleSheet("font-weight: bold; font-size: 14pt;")
         left_v_layout.addWidget(settings_title)
 
-        form = QFormLayout()
+        form_layout = QFormLayout()
+
+        # 水印文字（初始值从配置读取，确保存在）
         self.inp_text = QLineEdit(self.config['text'])
         self.inp_text.textChanged.connect(self.update_live_preview)
-        form.addRow("水印文字:", self.inp_text)
+        form_layout.addRow("水印文字:", self.inp_text)
 
+        # 字体大小
         self.sl_size = QSlider(Qt.Orientation.Horizontal)
         self.sl_size.setRange(1, 50)
         self.sl_size.setValue(self.config['size_percent'])
         self.sl_size.setToolTip("文字宽度占图片宽度的百分比")
         self.sl_size.valueChanged.connect(self.update_live_preview)
-        form.addRow("字体大小 (1-50%):", self.sl_size)
+        form_layout.addRow("字体大小 (1-50%):", self.sl_size)
 
+        # 透明度
         self.sl_opacity = QSlider(Qt.Orientation.Horizontal)
         self.sl_opacity.setRange(0, 100)
         self.sl_opacity.setValue(self.config['opacity'])
         self.sl_opacity.valueChanged.connect(self.update_live_preview)
-        form.addRow("透明度 (0-100%):", self.sl_opacity)
+        form_layout.addRow("透明度 (0-100%):", self.sl_opacity)
 
+        # 旋转角度
         self.sl_angle = QSlider(Qt.Orientation.Horizontal)
         self.sl_angle.setRange(0, 360)
         self.sl_angle.setValue(self.config['angle'])
         self.sl_angle.valueChanged.connect(self.update_live_preview)
-        form.addRow("旋转角度:", self.sl_angle)
+        form_layout.addRow("旋转角度:", self.sl_angle)
 
+        # 填充模式
         self.cmb_fill_mode = QComboBox()
         self.cmb_fill_mode.addItem("单个 (居中)", "single")
         self.cmb_fill_mode.addItem("平铺 (重复)", "tiled")
         idx = self.cmb_fill_mode.findData(self.config['fill_mode'])
-        if idx != -1: self.cmb_fill_mode.setCurrentIndex(idx)
+        if idx != -1:
+            self.cmb_fill_mode.setCurrentIndex(idx)
         self.cmb_fill_mode.currentTextChanged.connect(self.update_live_preview)
-        form.addRow("填充模式:", self.cmb_fill_mode)
+        form_layout.addRow("填充模式:", self.cmb_fill_mode)
 
+        # X/Y轴偏移
         self.sl_offset_x = QSlider(Qt.Orientation.Horizontal)
         self.sl_offset_x.setRange(-200, 200)
         self.sl_offset_x.setValue(self.config['offset_x'])
         self.sl_offset_x.valueChanged.connect(self.update_live_preview)
-        form.addRow("X轴偏移 (%):", self.sl_offset_x)
+        form_layout.addRow("X轴偏移 (%):", self.sl_offset_x)
 
         self.sl_offset_y = QSlider(Qt.Orientation.Horizontal)
         self.sl_offset_y.setRange(-200, 200)
         self.sl_offset_y.setValue(self.config['offset_y'])
         self.sl_offset_y.valueChanged.connect(self.update_live_preview)
-        form.addRow("Y轴偏移 (%):", self.sl_offset_y)
+        form_layout.addRow("Y轴偏移 (%):", self.sl_offset_y)
 
-        self.btn_color = QPushButton("选择颜色 ■")
+        # 颜色选择（仅灰/红/蓝）
+        self.btn_color = QPushButton("选择颜色 ■ (仅灰/红/蓝)")
         self.set_color_ui(self.config['color'], update_config=False)
         self.btn_color.clicked.connect(self.show_color_menu)
-        form.addRow("文字颜色:", self.btn_color)
+        form_layout.addRow("文字颜色:", self.btn_color)
 
-        left_v_layout.addLayout(form)
+        left_v_layout.addLayout(form_layout)
         left_v_layout.addSpacing(20)
 
-        # 操作按钮
+        # 5. 操作按钮
         self.btn_apply = QPushButton("▶ 应用水印到所有文件")
         self.btn_apply.setMinimumHeight(40)
         self.btn_apply.clicked.connect(self.run_batch_process)
@@ -711,7 +788,7 @@ class MainWindow(QMainWindow):
 
         left_v_layout.addStretch()
 
-        # 日志区域
+        # 6. 日志区域
         left_v_layout.addWidget(QLabel("运行日志:"))
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
@@ -720,31 +797,33 @@ class MainWindow(QMainWindow):
 
         main_h_layout.addWidget(left_panel, stretch=1)
 
-        # --- 右侧面板 (文件列表) ---
+        # ---------------------- 右侧面板（文件列表）----------------------
         right_panel = QWidget()
         right_v_layout = QVBoxLayout(right_panel)
 
+        # 1. 拖入提示
         self.lbl_status = QLabel(
-            "📂 请将 Word文档 (.docx) 或图片文件\n(PNG/JPG/BMP等) 拖入此处\n\n图片导出自动保存到：原文件夹/已加水印图片")
+            "📂 请将 Word文档 (.docx) 或图片文件\n(PNG/JPG/BMP等) 拖入此处\n\n导出路径：原文件夹/已加水印图片\n保留原格式（JPEG→JPG）\n颜色选项：仅灰色、红色、蓝色"
+        )
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setStyleSheet("border: 2px dashed #aaa; font-size: 16px; color: #555; padding: 40px;")
         right_v_layout.addWidget(self.lbl_status)
 
+        # 2. 文件列表（图标模式）
         self.list_widget = QListWidget()
         self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
         self.list_widget.setIconSize(QSize(150, 150))
         self.list_widget.setSpacing(10)
         self.list_widget.setMovement(QListWidget.Movement.Static)
         self.list_widget.setVisible(False)
-
-        # 启用多选模式和右键菜单
+        # 支持多选和右键菜单
         self.list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_widget.customContextMenuRequested.connect(self.on_list_context_menu)
         self.list_widget.itemDoubleClicked.connect(self.on_item_double_click)
-
         right_v_layout.addWidget(self.list_widget)
 
+        # 3. 进度条
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         right_v_layout.addWidget(self.progress)
@@ -756,118 +835,109 @@ class MainWindow(QMainWindow):
         selected_items = self.list_widget.selectedItems()
         if not selected_items:
             return
-
         menu = QMenu()
-
         # 批量修改水印
-        action_modify = QAction("修改水印", self)
-        action_modify.triggered.connect(self.batch_modify_watermark)
-        menu.addAction(action_modify)
-
+        modify_action = QAction("修改水印", self)
+        modify_action.triggered.connect(self.batch_modify_watermark)
+        menu.addAction(modify_action)
         # 批量不加水印
-        action_no_watermark = QAction("不加水印", self)
-        action_no_watermark.triggered.connect(self.batch_remove_watermark)
-        menu.addAction(action_no_watermark)
-
+        no_watermark_action = QAction("不加水印", self)
+        no_watermark_action.triggered.connect(self.batch_remove_watermark)
+        menu.addAction(no_watermark_action)
+        # 显示菜单
         menu.exec(self.list_widget.mapToGlobal(position))
 
     def on_item_double_click(self, item):
-        """双击项目进行单独编辑"""
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if not data:
+        """双击文件进行单独编辑（核心修复：补全settings字段）"""
+        item_data = item.data(Qt.ItemDataRole.UserRole)
+        if not item_data:
+            self.log("❌ 编辑失败：无图片数据")
             return
-
-        item_type, idx = data
-
+        item_type, idx = item_data
         try:
             if item_type == 'word':
-                # 编辑Word文档中的图片
+                # 编辑Word中的图片
                 word_item = self.image_parts[idx]
-                base_settings = word_item['settings'] if word_item['settings'] else {
-                    "text": self.inp_text.text(),
-                    "size_percent": self.sl_size.value(),
-                    "opacity": self.sl_opacity.value(),
-                    "angle": self.sl_angle.value(),
-                    "color": self.config['color'],
-                    "fill_mode": self.cmb_fill_mode.currentData(),
-                    "offset_x": self.sl_offset_x.value(),
-                    "offset_y": self.sl_offset_y.value()
-                }
-
+                # 1. 补全settings：以默认配置为基础，覆盖图片自身的settings（即使仅含skip_watermark）
+                base_settings = DEFAULT_CONFIG.copy()
+                if word_item.get('settings'):
+                    base_settings.update(word_item['settings'])
+                # 2. 打开编辑对话框（传递补全后的settings）
                 dlg = EditDialog(word_item['original'], base_settings, self)
                 if dlg.exec():
                     new_settings = dlg.get_settings()
-                    # 立即重新处理并更新
+                    # 重新处理图片
                     with io.BytesIO(word_item['original']) as bio:
                         pil_img = Image.open(bio)
+                        pil_format, file_ext = get_image_format(pil_img)
                         res_pil = apply_watermark_to_image(pil_img, new_settings)
                         out_io = io.BytesIO()
-                        res_pil.save(out_io, format="PNG")
+                        if pil_format == 'JPEG' and res_pil.mode == 'RGBA':
+                            res_pil = res_pil.convert('RGB')
+                        res_pil.save(out_io, format=pil_format, quality=90)
+                        # 更新数据（保存补全后的settings）
                         word_item['processed'] = out_io.getvalue()
                         word_item['settings'] = new_settings
-
-                    self.log(f"✏️ 已单独修改 Word图片 {idx + 1}")
+                        word_item['pil_format'] = pil_format
+                        word_item['file_ext'] = file_ext
+                    self.log(f"✏️ 单独修改 Word图片 {idx + 1} (.{file_ext})")
                     self.update_file_list()
 
             elif item_type == 'image':
                 # 编辑直接拖入的图片
                 img_item = self.direct_images[idx]
-                base_settings = img_item['settings'] if img_item['settings'] else {
-                    "text": self.inp_text.text(),
-                    "size_percent": self.sl_size.value(),
-                    "opacity": self.sl_opacity.value(),
-                    "angle": self.sl_angle.value(),
-                    "color": self.config['color'],
-                    "fill_mode": self.cmb_fill_mode.currentData(),
-                    "offset_x": self.sl_offset_x.value(),
-                    "offset_y": self.sl_offset_y.value()
-                }
-
-                # 直接传递PIL图片对象
+                # 1. 补全settings：避免缺失'text'等字段
+                base_settings = DEFAULT_CONFIG.copy()
+                if img_item.get('settings'):
+                    base_settings.update(img_item['settings'])
+                # 2. 打开编辑对话框
                 with Image.open(io.BytesIO(img_item['original_data'])) as pil_img:
                     dlg = EditDialog(pil_img, base_settings, self)
                     if dlg.exec():
                         new_settings = dlg.get_settings()
-                        # 立即重新处理并更新
+                        # 重新处理图片
                         with Image.open(io.BytesIO(img_item['original_data'])) as pil_img:
+                            pil_format, file_ext = get_image_format(pil_img)
                             res_pil = apply_watermark_to_image(pil_img, new_settings)
                             out_io = io.BytesIO()
-                            res_pil.save(out_io, format="PNG")
+                            if pil_format == 'JPEG' and res_pil.mode == 'RGBA':
+                                res_pil = res_pil.convert('RGB')
+                            res_pil.save(out_io, format=pil_format, quality=90)
+                            # 更新数据
                             img_item['processed_data'] = out_io.getvalue()
                             img_item['settings'] = new_settings
-
-                        self.log(f"✏️ 已单独修改图片: {os.path.basename(img_item['original_path'])}")
+                            img_item['pil_format'] = pil_format
+                            img_item['file_ext'] = file_ext
+                        self.log(f"✏️ 单独修改图片: {os.path.basename(img_item['original_path'])} (.{file_ext})")
                         self.update_file_list()
-
         except Exception as e:
-            self.log(f"❌ 单独编辑失败: {str(e)}")
-            QMessageBox.warning(self, "编辑失败", f"修改图片时出错: {str(e)}")
+            self.log(f"❌ 单独编辑失败: {str(e)}")  # 输出完整错误信息，便于排查
+            QMessageBox.warning(self, "编辑失败", f"修改出错: {str(e)}")
 
     def batch_modify_watermark(self):
-        """批量修改选中图片的水印设置"""
+        """批量修改选中图片的水印（补全settings）"""
         selected_items = self.list_widget.selectedItems()
         if not selected_items:
             return
-
-        # 使用第一个选中图片作为预览
+        # 获取第一个选中项作为预览
         first_item_data = selected_items[0].data(Qt.ItemDataRole.UserRole)
         if not first_item_data:
+            self.log("⚠️ 批量修改失败：无预览图片数据")
             return
-
         item_type, idx = first_item_data
         preview_image = None
-
         try:
             if item_type == 'word':
                 preview_image = Image.open(io.BytesIO(self.image_parts[idx]['original']))
             else:
                 preview_image = Image.open(io.BytesIO(self.direct_images[idx]['original_data']))
         except Exception as e:
-            self.log(f"⚠️ 加载预览图片失败: {e}")
+            self.log(f"⚠️ 加载预览图失败: {str(e)}")
             return
 
-        # 打开批量编辑对话框
-        current_settings = {
+        # 1. 补全当前全局设置，避免缺失字段
+        current_settings = DEFAULT_CONFIG.copy()
+        current_settings.update({
             "text": self.inp_text.text(),
             "size_percent": self.sl_size.value(),
             "opacity": self.sl_opacity.value(),
@@ -876,136 +946,135 @@ class MainWindow(QMainWindow):
             "fill_mode": self.cmb_fill_mode.currentData(),
             "offset_x": self.sl_offset_x.value(),
             "offset_y": self.sl_offset_y.value()
-        }
-
+        })
+        # 2. 打开批量编辑对话框
         dlg = BatchEditDialog(preview_image, current_settings, self)
         if dlg.exec():
             new_settings = dlg.get_settings()
-
-            # 立即应用到所有选中的图片并重新处理
             processed_count = 0
+            # 应用到所有选中项
             for item in selected_items:
-                data = item.data(Qt.ItemDataRole.UserRole)
-                if not data:
+                item_data = item.data(Qt.ItemDataRole.UserRole)
+                if not item_data:
                     continue
-
-                item_type, idx = data
+                item_type, idx = item_data
                 try:
                     if item_type == 'word':
-                        # 立即重新处理该图片
+                        # 处理Word图片
                         with io.BytesIO(self.image_parts[idx]['original']) as bio:
                             pil_img = Image.open(bio)
+                            pil_format, file_ext = get_image_format(pil_img)
                             res_pil = apply_watermark_to_image(pil_img, new_settings)
                             out_io = io.BytesIO()
-                            res_pil.save(out_io, format="PNG")
+                            if pil_format == 'JPEG' and res_pil.mode == 'RGBA':
+                                res_pil = res_pil.convert('RGB')
+                            res_pil.save(out_io, format=pil_format, quality=90)
+                            # 更新数据（保存补全后的settings）
                             self.image_parts[idx]['processed'] = out_io.getvalue()
                             self.image_parts[idx]['settings'] = new_settings
-
-                        self.log(f"✏️ 批量修改 Word图片 {idx + 1}")
+                            self.image_parts[idx]['pil_format'] = pil_format
+                            self.image_parts[idx]['file_ext'] = file_ext
+                        self.log(f"✏️ 批量修改 Word图片 {idx + 1} (.{file_ext})")
                     else:
-                        # 立即重新处理该图片
+                        # 处理直接拖入的图片
                         with Image.open(io.BytesIO(self.direct_images[idx]['original_data'])) as pil_img:
+                            pil_format, file_ext = get_image_format(pil_img)
                             res_pil = apply_watermark_to_image(pil_img, new_settings)
                             out_io = io.BytesIO()
-                            res_pil.save(out_io, format="PNG")
+                            if pil_format == 'JPEG' and res_pil.mode == 'RGBA':
+                                res_pil = res_pil.convert('RGB')
+                            res_pil.save(out_io, format=pil_format, quality=90)
+                            # 更新数据
                             self.direct_images[idx]['processed_data'] = out_io.getvalue()
                             self.direct_images[idx]['settings'] = new_settings
-
-                        self.log(f"✏️ 批量修改: {os.path.basename(self.direct_images[idx]['original_path'])}")
-
-                    # 移除跳过水印标记
+                            self.direct_images[idx]['pil_format'] = pil_format
+                            self.direct_images[idx]['file_ext'] = file_ext
+                        self.log(
+                            f"✏️ 批量修改图片: {os.path.basename(self.direct_images[idx]['original_path'])} (.{file_ext})")
+                    # 移除"不加水印"标记
                     if " [不加水印]" in item.text():
                         item.setText(item.text().replace(" [不加水印]", ""))
-
                     processed_count += 1
-
                 except Exception as e:
-                    self.log(f"⚠️ 处理失败 {item.text()}: {e}")
-
-            self.log(f"✅ 已批量修改 {processed_count} 张图片的水印设置")
+                    self.log(f"⚠️ 处理失败 {item.text()}: {str(e)}")
+            self.log(f"✅ 批量修改完成，共处理 {processed_count} 张图片")
             self.update_file_list()
 
     def batch_remove_watermark(self):
-        """批量移除选中图片的水印（恢复为原图）"""
+        """批量设置图片不加水印（保留其他字段，避免后续编辑出错）"""
         selected_items = self.list_widget.selectedItems()
         if not selected_items:
             return
-
         for item in selected_items:
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if not data:
+            item_data = item.data(Qt.ItemDataRole.UserRole)
+            if not item_data:
                 continue
-
-            item_type, idx = data
-            # 设置跳过水印标记
-            skip_settings = {"skip_watermark": True}
-
+            item_type, idx = item_data
+            # 关键修复：设置skip_watermark时，保留其他字段（以默认配置为基础）
+            skip_settings = DEFAULT_CONFIG.copy()
+            skip_settings['skip_watermark'] = True  # 仅添加跳过标记，不删除其他字段
             if item_type == 'word':
+                # 保留原图片的其他设置（如有）
+                if self.image_parts[idx].get('settings'):
+                    skip_settings.update(self.image_parts[idx]['settings'])
                 self.image_parts[idx]['settings'] = skip_settings
-                # 立即恢复为原始数据
                 self.image_parts[idx]['processed'] = self.image_parts[idx]['original']
+                # 恢复原格式
+                with io.BytesIO(self.image_parts[idx]['original']) as bio:
+                    pil_img = Image.open(bio)
+                    pil_format, file_ext = get_image_format(pil_img)
+                    self.image_parts[idx]['pil_format'] = pil_format
+                    self.image_parts[idx]['file_ext'] = file_ext
             else:
+                # 保留原图片的其他设置（如有）
+                if self.direct_images[idx].get('settings'):
+                    skip_settings.update(self.direct_images[idx]['settings'])
                 self.direct_images[idx]['settings'] = skip_settings
-                # 立即恢复为原始数据
                 self.direct_images[idx]['processed_data'] = self.direct_images[idx]['original_data']
-
-            # 添加视觉标记
+                # 恢复原格式
+                pil_format, file_ext = get_image_format(self.direct_images[idx]['original_path'])
+                self.direct_images[idx]['pil_format'] = pil_format
+                self.direct_images[idx]['file_ext'] = file_ext
+            # 添加标记
             if " [不加水印]" not in item.text():
                 item.setText(item.text() + " [不加水印]")
-
-        self.log(f"✅ 已批量设置 {len(selected_items)} 张图片: 不加水印")
+        self.log(f"✅ 批量设置 {len(selected_items)} 张图片：不加水印")
         self.update_file_list()
 
-    def log(self, msg):
-        """添加日志"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_box.appendPlainText(f"[{timestamp}] {msg}")
-        self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
-        QApplication.processEvents()
-
-    def dragEnterEvent(self, e: QDragEnterEvent):
-        """拖拽进入事件"""
-        if e.mimeData().hasUrls():
-            e.accept()
+    # ---------------------- 拖拽相关事件 ----------------------
+    def dragEnterEvent(self, event):
+        """拖拽进入：仅接受文件"""
+        if event.mimeData().hasUrls():
+            event.accept()
         else:
-            e.ignore()
+            event.ignore()
 
-    def dropEvent(self, e: QDropEvent):
-        """拖拽释放事件"""
-        urls = e.mimeData().urls()
+    def dropEvent(self, event):
+        """拖拽释放：处理Word/图片"""
+        urls = event.mimeData().urls()
         if not urls:
             return
-
-        # 处理所有拖拽的文件
         file_paths = [url.toLocalFile() for url in urls]
-        word_files = []
-        image_files = []
+        word_files = [p for p in file_paths if p.endswith(".docx")]
+        image_files = [p for p in file_paths if is_supported_image(p)]
 
-        for path in file_paths:
-            if path.endswith(".docx"):
-                word_files.append(path)
-            elif is_supported_image(path):
-                image_files.append(path)
-            else:
-                self.log(f"❌ 不支持的文件格式: {os.path.basename(path)}")
-
-        # 优先处理Word文档（一次只能处理一个）
+        # 处理Word（一次一个）
         if word_files:
             self.load_doc(word_files[0])
             if len(word_files) > 1:
-                self.log(f"⚠️ 一次只能处理一个Word文档，已忽略其他 {len(word_files) - 1} 个")
-
-        # 处理图片文件
+                self.log(f"⚠️ 一次仅支持1个Word，忽略其他 {len(word_files) - 1} 个")
+        # 处理图片
         if image_files:
             self.load_images(image_files)
 
+    # ---------------------- 文件加载 ----------------------
     def load_doc(self, path):
-        """加载Word文档"""
+        """加载Word文档并提取图片（初始化settings为完整字典）"""
         self.radio_word.setChecked(True)
         self.doc_path = path
         self.direct_images = []  # 清空图片列表
-        self.log(f"📥 正在加载Word文档: {os.path.basename(path)}")
-        self.lbl_status.setText("正在分析文档中的图片...")
+        self.log(f"📥 加载Word文档: {os.path.basename(path)}")
+        self.lbl_status.setText("分析文档中的图片...")
         self.lbl_status.setVisible(True)
         self.list_widget.setVisible(False)
         QApplication.processEvents()
@@ -1014,121 +1083,142 @@ class MainWindow(QMainWindow):
             self.doc = Document(path)
             self.image_parts = []
             count = 0
+            # 提取文档中的图片
             for rel in self.doc.part.rels.values():
                 if "image" in rel.target_ref:
                     part = rel.target_part
+                    # 识别图片格式
+                    with io.BytesIO(part.blob) as bio:
+                        pil_img = Image.open(bio)
+                        pil_format, file_ext = get_image_format(pil_img)
+                    # 初始化settings为完整字典（避免后续编辑缺失字段）
+                    init_settings = DEFAULT_CONFIG.copy()
                     self.image_parts.append({
                         "type": "word",
                         "part": part,
                         "original": part.blob,
                         "processed": part.blob,
-                        "settings": None
+                        "settings": init_settings,  # 初始为完整默认配置
+                        "pil_format": pil_format,
+                        "file_ext": file_ext
                     })
                     count += 1
-
             if count == 0:
-                self.log("⚠️ 文档中未发现图片。")
+                self.log("⚠️ Word文档中无图片")
                 self.lbl_status.setText("文档无图片")
                 return
-
-            self.log(f"✅ 成功检测到 {count} 张图片 (来自Word文档)")
+            # 加载成功
+            self.log(f"✅ 提取到 {count} 张图片（来自Word）")
             self.lbl_status.setVisible(False)
             self.list_widget.setVisible(True)
             self.btn_apply.setEnabled(True)
             self.btn_export.setEnabled(True)
             self.update_file_list()
-
         except Exception as e:
-            self.log(f"❌ 读取Word文档失败: {str(e)}")
-            self.lbl_status.setText("读取Word文档失败")
+            self.log(f"❌ 加载Word失败: {str(e)}")
+            self.lbl_status.setText("加载Word失败")
 
     def load_images(self, paths):
-        """加载直接拖入的图片"""
+        """加载直接拖入的图片（初始化settings为完整字典）"""
         self.radio_image.setChecked(True)
-        self.doc = None  # 清空Word文档
-        self.image_parts = []  # 清空Word图片列表
-        self.log(f"📥 正在加载图片文件: 共 {len(paths)} 张")
-        self.lbl_status.setText("正在加载图片...")
+        self.doc = None  # 清空Word
+        self.image_parts = []  # 清空Word图片
+        self.log(f"📥 加载图片: 共 {len(paths)} 张")
+        self.lbl_status.setText("加载图片中...")
         self.lbl_status.setVisible(True)
         self.list_widget.setVisible(False)
         QApplication.processEvents()
 
         try:
-            # 保存图片信息
             self.direct_images = []
             for path in paths:
                 with open(path, 'rb') as f:
                     original_data = f.read()
-
+                # 识别格式
+                pil_format, file_ext = get_image_format(path)
+                # 初始化settings为完整字典（避免后续编辑缺失字段）
+                init_settings = DEFAULT_CONFIG.copy()
                 self.direct_images.append({
                     "type": "image",
                     "original_path": path,
                     "original_data": original_data,
                     "processed_data": original_data,
-                    "format": "PNG",  # 强制设置为PNG
-                    "settings": None
+                    "pil_format": pil_format,
+                    "file_ext": file_ext,
+                    "settings": init_settings  # 初始为完整默认配置
                 })
-
-            self.log(f"✅ 成功加载 {len(self.direct_images)} 张图片")
+            # 加载成功
+            self.log(f"✅ 加载完成 {len(self.direct_images)} 张图片")
             self.lbl_status.setVisible(False)
             self.list_widget.setVisible(True)
             self.btn_apply.setEnabled(True)
             self.btn_export.setEnabled(True)
             self.update_file_list()
-
         except Exception as e:
             self.log(f"❌ 加载图片失败: {str(e)}")
             self.lbl_status.setText("加载图片失败")
 
+    # ---------------------- 文件列表更新 ----------------------
     def update_file_list(self):
-        """更新文件列表显示"""
+        """更新右侧文件列表预览"""
         self.list_widget.clear()
 
-        # 显示Word文档中的图片
+        # 1. 添加Word中的图片
         for i, item in enumerate(self.image_parts):
             try:
-                # 生成预览图
                 with Image.open(io.BytesIO(item['processed'])) as pil_img:
+                    # 生成缩略图
                     thumb = pil_img.copy()
                     thumb.thumbnail((200, 200))
                     thumb_io = io.BytesIO()
-                    thumb.save(thumb_io, format="PNG")
-
-                    qt_img = QImage.fromData(thumb_io.getvalue())
-                    pix = QPixmap.fromImage(qt_img)
-                    list_item = QListWidgetItem(QIcon(pix), f"Word图片 {i + 1}")
-                    if isinstance(item.get('settings'), dict) and item['settings'].get('skip_watermark'):
-                        list_item.setText(list_item.text() + " [不加水印]")
+                    thumb.save(thumb_io, format=item['pil_format'], quality=80)
+                    # 转为QPixmap
+                    qim = QImage.fromData(thumb_io.getvalue())
+                    pix = QPixmap.fromImage(qim)
+                    # 判断是否跳过水印（settings已补全，无KeyError）
+                    settings = item.get('settings', {})
+                    item_text = f"Word图片 {i + 1} (.{item['file_ext']})"
+                    if settings.get('skip_watermark'):
+                        item_text += " [不加水印]"
+                    # 创建列表项
+                    list_item = QListWidgetItem(QIcon(pix), item_text)
                     list_item.setData(Qt.ItemDataRole.UserRole, ('word', i))
                     self.list_widget.addItem(list_item)
             except Exception as e:
-                self.log(f"⚠️ 生成预览失败 (Word图片 {i + 1}): {e}")
+                self.log(f"⚠️ 生成预览失败 (Word图片 {i + 1}): {str(e)}")
 
-        # 显示直接拖入的图片
+        # 2. 添加直接拖入的图片
         for i, item in enumerate(self.direct_images):
             try:
-                # 生成预览图
                 with Image.open(io.BytesIO(item['processed_data'])) as pil_img:
+                    # 生成缩略图
                     thumb = pil_img.copy()
                     thumb.thumbnail((200, 200))
                     thumb_io = io.BytesIO()
-                    thumb.save(thumb_io, format="PNG")
-
-                    qt_img = QImage.fromData(thumb_io.getvalue())
-                    pix = QPixmap.fromImage(qt_img)
+                    thumb.save(thumb_io, format=item['pil_format'], quality=80)
+                    # 转为QPixmap
+                    qim = QImage.fromData(thumb_io.getvalue())
+                    pix = QPixmap.fromImage(qim)
+                    # 判断是否跳过水印
+                    settings = item.get('settings', {})
                     filename = os.path.basename(item['original_path'])
-                    list_item = QListWidgetItem(QIcon(pix), filename)
-                    if isinstance(item.get('settings'), dict) and item['settings'].get('skip_watermark'):
-                        list_item.setText(list_item.text() + " [不加水印]")
+                    item_text = f"{filename} (.{item['file_ext']})"
+                    if settings.get('skip_watermark'):
+                        item_text += " [不加水印]"
+                    # 创建列表项
+                    list_item = QListWidgetItem(QIcon(pix), item_text)
                     list_item.setData(Qt.ItemDataRole.UserRole, ('image', i))
                     self.list_widget.addItem(list_item)
             except Exception as e:
-                self.log(f"⚠️ 生成预览失败 ({os.path.basename(item['original_path'])}): {e}")
+                filename = os.path.basename(item['original_path']) if item.get('original_path') else "未知图片"
+                self.log(f"⚠️ 生成预览失败 ({filename}): {str(e)}")
 
+    # ---------------------- 批量应用水印 ----------------------
     def run_batch_process(self):
-        """批量应用水印"""
-        # 获取当前全局设置
-        global_settings = {
+        """批量应用水印（支持重复执行）"""
+        # 获取当前全局设置（补全后传递）
+        global_settings = DEFAULT_CONFIG.copy()
+        global_settings.update({
             "text": self.inp_text.text(),
             "size_percent": self.sl_size.value(),
             "opacity": self.sl_opacity.value(),
@@ -1137,43 +1227,55 @@ class MainWindow(QMainWindow):
             "fill_mode": self.cmb_fill_mode.currentData(),
             "offset_x": self.sl_offset_x.value(),
             "offset_y": self.sl_offset_y.value()
-        }
-        self.config.update(global_settings)
+        })
+        # 保存配置（确保配置完整）
+        self.config = global_settings.copy()
         save_config(self.config)
 
-        self.log("⏳ 开始批量应用水印...")
+        self.log("⏳ 开始批量应用水印（支持重复执行）")
         self.progress.setVisible(True)
         self.btn_apply.setEnabled(False)
         self.btn_export.setEnabled(False)
 
-        # 根据当前模式处理
+        # 处理Word图片
         if self.radio_word.isChecked() and self.image_parts:
-            # 处理Word文档中的图片
             total = len(self.image_parts)
             self.progress.setRange(0, total)
-
             for i, item in enumerate(self.image_parts):
                 self.progress.setValue(i)
-                current_settings = item['settings'] if item['settings'] else global_settings
-
+                # 补全图片自身的settings（避免缺失字段）
+                current_settings = DEFAULT_CONFIG.copy()
+                if item.get('settings'):
+                    current_settings.update(item['settings'])
+                # 若设置了skip_watermark，跳过当前图片
+                if current_settings.get('skip_watermark'):
+                    self.log(f"⏭️ 跳过 Word图片 {i + 1}（已设置不加水印）")
+                    continue
                 try:
-                    with io.BytesIO(item['original']) as bio:
+                    with io.BytesIO(item['original']) as bio:  # 基于原图重新处理（支持重复）
                         pil_img = Image.open(bio)
+                        pil_format, file_ext = get_image_format(pil_img)
                         res_pil = apply_watermark_to_image(pil_img, current_settings)
                         out_io = io.BytesIO()
-                        # 强制PNG格式
-                        res_pil.save(out_io, format="PNG")
+                        if pil_format == 'JPEG' and res_pil.mode == 'RGBA':
+                            res_pil = res_pil.convert('RGB')
+                        res_pil.save(out_io, format=pil_format, quality=90)
+                        # 更新数据（保存补全后的settings）
                         item['processed'] = out_io.getvalue()
+                        item['settings'] = current_settings
+                        item['pil_format'] = pil_format
+                        item['file_ext'] = file_ext
                 except Exception as e:
-                    self.log(f"⚠️ 处理失败 (Word图片 {i + 1}): {e}")
-
+                    self.log(f"⚠️ 处理失败 (Word图片 {i + 1}): {str(e)}")
+            # 处理完成
             self.progress.setValue(total)
-            self.log("✅ Word文档图片水印应用完成")
+            self.log("✅ Word图片水印应用完成")
             self.update_file_list()
+            self.btn_apply.setEnabled(True)
             self.btn_export.setEnabled(True)
 
+        # 处理直接拖入的图片（线程）
         elif self.radio_image.isChecked() and self.direct_images:
-            # 处理直接拖入的图片（使用线程避免UI阻塞）
             image_paths = [item['original_path'] for item in self.direct_images]
             self.process_thread = ImageProcessThread(image_paths, global_settings)
             self.process_thread.progress_update.connect(self.on_process_progress)
@@ -1181,128 +1283,146 @@ class MainWindow(QMainWindow):
             self.process_thread.error_signal.connect(self.log)
             self.process_thread.start()
 
-        self.progress.setVisible(False)
+        else:
+            # 无文件可处理
+            self.progress.setVisible(False)
+            self.btn_apply.setEnabled(True)
+            self.btn_export.setEnabled(True)
 
     @pyqtSlot(int)
     def on_process_progress(self, value):
-        """图片处理进度更新"""
+        """更新图片处理进度"""
         self.progress.setRange(0, 100)
         self.progress.setValue(value)
 
     @pyqtSlot(list)
     def on_image_process_finished(self, processed_images):
         """图片处理线程完成"""
-        self.direct_images = processed_images
-        self.log("✅ 直接拖入图片水印应用完成")
+        # 更新图片数据（保存补全后的settings）
+        for processed_img in processed_images:
+            for original_img in self.direct_images:
+                if processed_img['original_path'] == original_img['original_path']:
+                    # 保留原图片的skip_watermark设置（如有）
+                    final_settings = processed_img['settings'].copy()
+                    if original_img.get('settings', {}).get('skip_watermark'):
+                        final_settings['skip_watermark'] = True
+                    original_img.update({
+                        "processed_data": processed_img['processed_data'],
+                        "settings": final_settings,
+                        "pil_format": processed_img['pil_format'],
+                        "file_ext": processed_img['file_ext']
+                    })
+                    break
+        self.log("✅ 图片水印应用完成（支持重复执行）")
         self.update_file_list()
         self.btn_apply.setEnabled(True)
         self.btn_export.setEnabled(True)
         self.progress.setVisible(False)
 
+    # ---------------------- 文件导出（补全中断的跨平台目录打开逻辑）----------------------
     def export_files(self):
-        """导出文件"""
+        """导出处理后的文件"""
+        # 导出Word
         if self.radio_word.isChecked() and self.doc and self.image_parts:
-            # Word文档导出保持原有逻辑（仍需选择路径）
             default_name = os.path.splitext(self.doc_path)[0] + "_水印版.docx"
-            path, _ = QFileDialog.getSaveFileName(self, "保存Word文档", default_name, "Word Documents (*.docx)")
+            save_path, _ = QFileDialog.getSaveFileName(
+                self, "保存Word文档", default_name, "Word文档 (*.docx)"
+            )
+            if not save_path:
+                return
+            self.log(f"💾 保存Word: {os.path.basename(save_path)}")
+            try:
+                # 替换文档中的图片
+                for item in self.image_parts:
+                    item['part']._blob = item['processed']
+                self.doc.save(save_path)
+                self.log("🎉 Word导出成功")
+                QMessageBox.information(self, "成功", f"Word保存至:\n{save_path}")
+            except Exception as e:
+                self.log(f"❌ Word保存失败: {str(e)}")
+                QMessageBox.critical(self, "失败", str(e))
 
-            if path:
-                self.log(f"💾 正在保存Word文档: {os.path.basename(path)}")
-                try:
-                    for item in self.image_parts:
-                        item['part']._blob = item['processed']
-                    self.doc.save(path)
-                    self.log("🎉 Word文档导出成功！")
-                    QMessageBox.information(self, "导出成功", f"Word文档已保存至:\n{path}")
-                except Exception as e:
-                    self.log(f"❌ Word文档保存失败: {e}")
-                    QMessageBox.critical(self, "保存失败", str(e))
-
+        # 导出图片（自动路径，补全跨平台目录打开逻辑）
         elif self.radio_image.isChecked() and self.direct_images:
-            # 图片导出：自动保存到原文件夹的「已加水印图片」目录，强制PNG格式
-            self.log("💾 开始导出图片（自动保存到原文件夹/已加水印图片，格式：PNG）...")
+            self.log("💾 开始导出图片（自动路径：原文件夹/已加水印图片）")
             self.progress.setVisible(True)
             self.progress.setRange(0, len(self.direct_images))
-
             success_count = 0
             failed_files = []
-            output_dirs = set()  # 记录所有输出目录，方便最后打开
+            output_dirs = set()
 
             for i, img_item in enumerate(self.direct_images):
                 self.progress.setValue(i)
                 try:
-                    # 检查是否跳过水印
-                    settings = img_item.get('settings')
-                    skip_watermark = isinstance(settings, dict) and settings.get('skip_watermark', False)
-
+                    # 补全settings，避免判断时缺失字段
+                    settings = img_item.get('settings', {})
+                    skip_watermark = settings.get('skip_watermark', False)
+                    export_data = img_item['original_data'] if skip_watermark else img_item['processed_data']
                     if skip_watermark:
-                        processed_data = img_item['original_data']
                         self.log(f"⏭️ 跳过水印: {os.path.basename(img_item['original_path'])}")
-                    else:
-                        processed_data = img_item['processed_data']
 
-                    # 获取原图片的目录和文件名
+                    # 构建导出路径
                     original_path = img_item['original_path']
                     original_dir = os.path.dirname(original_path)
-                    filename_without_ext = os.path.splitext(os.path.basename(original_path))[0]
-
-                    # 创建输出目录：原目录/已加水印图片
+                    filename_no_ext = os.path.splitext(os.path.basename(original_path))[0]
+                    file_ext = img_item['file_ext']
+                    # 输出目录：原文件夹/已加水印图片
                     output_dir = os.path.join(original_dir, "已加水印图片")
-                    os.makedirs(output_dir, exist_ok=True)  # 不存在则创建，存在则忽略
+                    os.makedirs(output_dir, exist_ok=True)
                     output_dirs.add(output_dir)
 
-                    # 构建输出文件名：原文件名_水印.png （强制PNG扩展名）
-                    output_filename = f"{filename_without_ext}_水印.png"
+                    # 避免文件名重复（加时间戳）
+                    output_filename = f"{filename_no_ext}_水印.{file_ext}"
                     output_path = os.path.join(output_dir, output_filename)
-
-                    # 避免文件名重复（如果已存在则添加时间戳）
                     if os.path.exists(output_path):
                         timestamp = datetime.now().strftime("%H%M%S")
-                        output_filename = f"{filename_without_ext}_水印_{timestamp}.png"
+                        output_filename = f"{filename_no_ext}_水印_{timestamp}.{file_ext}"
                         output_path = os.path.join(output_dir, output_filename)
 
                     # 保存图片
                     with open(output_path, 'wb') as f:
-                        f.write(processed_data)
-
+                        f.write(export_data)
                     success_count += 1
                     self.log(f"✅ 保存成功: {os.path.basename(output_path)}")
-
                 except Exception as e:
-                    err_msg = f"图片 {os.path.basename(img_item['original_path'])}: {str(e)}"
+                    err_msg = f"{os.path.basename(img_item['original_path'])}: {str(e)}"
                     self.log(f"⚠️ 保存失败: {err_msg}")
                     failed_files.append(err_msg)
 
+            # 导出完成
             self.progress.setValue(len(self.direct_images))
             self.progress.setVisible(False)
-
-            # 导出结果提示
-            result_msg = f"🎉 图片导出完成！\n\n成功保存 {success_count}/{len(self.direct_images)} 张图片\n\n输出目录："
+            # 显示结果
+            result_msg = f"🎉 图片导出完成！\n成功: {success_count}/{len(self.direct_images)} 张\n\n输出目录："
             for dir_path in output_dirs:
                 result_msg += f"\n• {dir_path}"
-
+            # 显示失败信息（前5个）
             if failed_files:
-                result_msg += f"\n\n⚠️ 失败文件 ({len(failed_files)} 个):"
-                for err in failed_files[:5]:  # 只显示前5个失败信息
+                result_msg += f"\n\n⚠️ 失败 ({len(failed_files)} 个):"
+                for err in failed_files[:5]:
                     result_msg += f"\n• {err}"
                 if len(failed_files) > 5:
-                    result_msg += f"\n• 还有 {len(failed_files) - 5} 个文件保存失败，请查看日志"
+                    result_msg += f"\n• 还有 {len(failed_files) - 5} 个失败（见日志）"
+            QMessageBox.information(self, "导出成功", result_msg)
 
-            QMessageBox.information(self, "图片导出成功", result_msg)
-
-            # 自动打开第一个输出目录（如果有）
+            # 补全跨平台自动打开目录逻辑（Windows/Mac/Linux）
             if output_dirs:
                 first_dir = next(iter(output_dirs))
-                if platform.system() == "Windows":
-                    os.startfile(first_dir)
-                elif platform.system() == "Darwin":
-                    os.system(f"open {first_dir}")
-                else:
-                    os.system(f"xdg-open {first_dir}")
+                try:
+                    if platform.system() == "Windows":
+                        os.startfile(first_dir)
+                    elif platform.system() == "Darwin":  # MacOS
+                        os.system(f"open '{first_dir}'")
+                    else:  # Linux
+                        os.system(f"xdg-open '{first_dir}'")
+                    self.log(f"📂 已自动打开输出目录: {first_dir}")
+                except Exception as e:
+                    self.log(f"⚠️ 自动打开目录失败: {str(e)}，请手动打开: {first_dir}")
 
 
+# --- 程序入口（完整闭合）---
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec())
